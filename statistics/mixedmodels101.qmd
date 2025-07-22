@@ -1,0 +1,356 @@
+---
+title: "Mixed Model 101 with Python"
+author: "Naomi Xia"
+format:
+  html:
+    math: mathjax
+    toc: true
+    code-fold: true
+jupyter: python3
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Introduction
+
+What are mixed models?
+
+| Model Type                   | Description                                   | When to Use                                                   |
+| ---------------------------- | --------------------------------------------- | ------------------------------------------------------------- |
+| **Fixed Effects**            | Assumes effects are constant across all units | When all predictor levels are of interest (e.g., A vs B only) |
+| **Random Effects**           | Assumes effects are drawn from a population   | When modeling variation from groups/clusters (e.g., subjects) either baseline offset (**random intercept**) or group-specific response (**random slope**)|
+| **Mixed Effects (LMM/GLMM)** | Combines fixed and random effects             | When you have both: e.g., repeated measures within subjects   |
+
+Use cases:
+
+- Repeated Measures (same subject over time)
+- Hierarchical Data (students nested in schools)
+- Grouped Data (group-specific variation such as gender)
+
+Using linear regression will
+
+1) ignore within-subject/group correlation
+2) underestimate standard errors
+3) inflate type I errors
+
+| Feature            | Fixed Effect for Subject              | Random Effect for Subject           |
+| ------------------ | ------------------------------------- | ----------------------------------- |
+| Coefficient type   | Estimated for each subject            | Drawn from a shared distribution    |
+| Design matrix size | #subjects - 1                         | #subjects                           |
+| Coefficients       | #subjects - 1                         | 1 (intercept variance)              |
+| Interpretation     | Specific to these subjects            | Generalizes to all subjects         |
+| Model flexibility  | No shrinkage (no pooling)             | Shrinks estimates (partial pooling) |
+| Good for...        | Small # of subjects you care about    | Many subjects; general inference    |
+
+For the practical component we will use the `statsmodels`’ `MixedLM` classes.
+
+# Coefficient Estimation
+**Fixed Effects** 
+
+Ordinary Least Squares or Maximum Likelihood -> coefficient $\hat{b}$ is estimated directly
+$$
+\hat{\boldsymbol{b}} = (\mathbf{X}^\top \mathbf{X})^{-1} \mathbf{X}^\top \mathbf{y}
+$$
+
+**Random Effects** 
+
+ML or Restricted Maximum Likelihood
+
+The following are estimated: 
+
+- $\mathbf{G}$ = Variance–covariance matrix of random effects
+- $\sigma^2$ = Residual (error) variance
+
+These are expressed in the equation for total variance of y, where V is the marginal variance matrix of y (how variable the observations are across all sources of randomness):
+$$ \mathbf{V} = \mathbf{ZGZ}^\top + \sigma^2\mathbf{I}
+$$
+
+$\mathbf{G}$ and $\sigma^2$ are estimated by maximizing the likelihood of observed data y, under the assumption that: 
+$$
+\mathbf{y} \sim \mathcal{N}(\mathbf{X}\boldsymbol{\beta}, \mathbf{V})
+$$
+
+Once variance components are estimated, the random effects $\hat{b}$ are obtained as conditional modes:
+$$ \hat{b} = \text{shrinkage-weighted average of subject mean and population mean}
+$$
+This is the Best Linear Unbiased Predictor (BLUP) for the random effects.
+$$
+\hat{\mathbf{b}} = \mathbb{E}[\mathbf{b} \mid \mathbf{y}] = \hat{\mathbf{G}} \mathbf{Z}^\top \hat{\mathbf{V}}^{-1} (\mathbf{y} - \mathbf{X} \hat{\boldsymbol{\beta}})
+$$
+
+- $\mathbb{E}[\mathbf{b} \mid \mathbf{y}]$: expected value of random effect coefficients, given y
+- shrinks toward 0 if $\hat{G}$ is small
+- shrinks less if more data
+
+It shrinks less if the subject has a lot of data
+
+# Simpon's Paradox in practice
+We are interested in the effect of a treatment on psychiatric evaluation scores from multiple hospital centers. Let's look at an example where we:
+
+1) fit a naive linear model to assess effects of treatment
+2) fit a fixed effect model of hospital
+3) fit a random intercept model for hospital
+We see that when looking at overall data, treatment actually makes psychiatric scores worse! But wait, when we account for hospital baselines (differences in severity of patients admitted), we can see that treatment improves scores within each hospital. This is **Simpson's Paradox**. 
+
+```{python}
+import pandas as pd
+import numpy as np
+import statsmodels.formula.api as smf
+import statsmodels.api as sm
+
+# ── Simulate minimal data for clear Simpson's paradox ───────────────────────────
+np.random.seed(42)
+hospitals = ['H1', 'H2']
+
+hospital_props = {
+    'H1': {'intercept': 0,  'treat_rate': 0.8},
+    'H2': {'intercept': 10, 'treat_rate': 0.2}
+}
+
+data = []
+n_per = 200
+
+for hosp, props in hospital_props.items():
+    for _ in range(n_per):
+        # Treatment assignment
+        tr = np.random.binomial(1, props['treat_rate'])
+        # True treatment effect +1
+        y = props['intercept'] + tr * 1 + np.random.normal(scale=1)
+        data.append({'hospital': hosp, 'treatment': tr, 'y': y})
+
+df = pd.DataFrame(data)
+
+# ── Fit models ─────────────────────────────────────────────────────────────────
+models = {
+    'Naïve OLS': smf.ols('y ~ treatment', data=df).fit(),
+    'Fixed-effects OLS': smf.ols('y ~ treatment + C(hospital)', data=df).fit(),
+    'Random-intercept LMM': sm.MixedLM.from_formula(
+        'y ~ treatment', groups='hospital', re_formula='1', data=df
+    ).fit()
+}
+
+# ── Summarize treatment estimates ───────────────────────────────────────────────
+results = []
+for name, m in models.items():
+    est = m.params['treatment']
+    ci_low, ci_high = m.conf_int().loc['treatment']
+    sd = np.sqrt(m.cov_re.iloc[0,0]) if name=='Random-intercept LMM' else np.nan
+    results.append({'Model': name,
+                    'Est.': round(est, 2),
+                    'CI Lower': round(ci_low,2),
+                    'CI Upper': round(ci_high,2)})
+summary_df = pd.DataFrame(results)
+
+# ── Display summary table ───────────────────────────────────────────────────────
+print(summary_df.to_markdown(index=False))
+```
+
+# Hospital properties:
+- Hospital 1: low intercept (baseline=0), high treatment rate (80%)
+
+- Hospital 2: high intercept (baseline=10), low treatment rate (20%)
+
+# Visualization
+```{python}
+import pandas as pd
+import numpy as np
+import statsmodels.formula.api as smf
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+
+# ── Simulate minimal data for clear Simpson's paradox ───────────────────────────
+np.random.seed(42)
+hospitals = ['H1', 'H2']
+# Hospital properties:
+hospital_props = {
+    'H1': {'intercept': 0,  'treat_rate': 0.8},
+    'H2': {'intercept': 10, 'treat_rate': 0.2}
+}
+
+data = []
+n_per = 200
+for hosp, props in hospital_props.items():
+    for _ in range(n_per):
+        tr = np.random.binomial(1, props['treat_rate'])
+        y = props['intercept'] + tr * 1 + np.random.normal(scale=1)
+        data.append({'hospital': hosp, 'treatment': tr, 'y': y})
+
+df = pd.DataFrame(data)
+
+# ── Fit models ─────────────────────────────────────────────────────────────────
+naive = smf.ols('y ~ treatment', data=df).fit()
+fe    = smf.ols('y ~ treatment + C(hospital)', data=df).fit()
+lmm   = sm.MixedLM.from_formula('y ~ treatment', groups='hospital', re_formula='1', data=df).fit()
+
+# ── Prepare predictions ─────────────────────────────────────────────────────────
+# Naive line: same for all
+pred_x = np.array([0,1])
+naive_line = naive.params['Intercept'] + naive.params['treatment'] * pred_x
+
+# Fixed-effect lines: intercept + hospital dummy adjustments
+fe_lines = {}
+for hosp in hospitals:
+    intercept_h = fe.params['Intercept'] + fe.params.get(f'C(hospital)[T.{hosp}]', 0)
+    slope = fe.params['treatment']
+    fe_lines[hosp] = intercept_h + slope * pred_x
+
+# Random-intercept LMM lines
+lmm_lines = {}
+re_intercepts = lmm.random_effects  # dict of intercepts
+slope_lmm = lmm.params['treatment']
+for hosp in hospitals:
+    intercept_h = lmm.params['Intercept'] + re_intercepts[hosp]['hospital']
+    lmm_lines[hosp] = intercept_h + slope_lmm * pred_x
+
+# ── Plot comparison ────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(15, 5), sharey=True)
+
+# Panel 1: Naive OLS
+axes[0].scatter(df['treatment'], df['y'], alpha=0.5)
+axes[0].plot(pred_x, naive_line, color='red', label='Naive fit')
+axes[0].set_title('Naive OLS')
+axes[0].set_xticks([0,1]); axes[0].set_xticklabels(['Control','Treatment'])
+axes[0].set_ylabel('Outcome y')
+axes[0].legend()
+
+# Panel 2: Fixed-effects
+for hosp, color in zip(hospitals, ['blue','green']):
+    axes[1].scatter(df[df['hospital']==hosp]['treatment'], df[df['hospital']==hosp]['y'],
+                    alpha=0.5, label=hosp, color=color)
+    axes[1].plot(pred_x, fe_lines[hosp], color=color)
+axes[1].set_title('Hospital-specific FE fits')
+axes[1].set_xticks([0,1]); axes[1].set_xticklabels(['Control','Treatment'])
+axes[1].legend(title='Hospital')
+
+# Panel 3: Random-intercept LMM
+for hosp, color in zip(hospitals, ['blue','green']):
+    axes[2].scatter(df[df['hospital']==hosp]['treatment'], df[df['hospital']==hosp]['y'],
+                    alpha=0.5, label=hosp, color=color)
+    axes[2].plot(pred_x, lmm_lines[hosp], color=color)
+axes[2].set_title('Random-intercept LMM fits')
+axes[2].set_xticks([0,1]); axes[2].set_xticklabels(['Control','Treatment'])
+axes[2].legend(title='Hospital')
+
+plt.tight_layout()
+plt.show()
+```
+
+# Visualization of hospital specific difference:
+Here, we demonstrate how useful mixed models are at fitting different slopes by hospital. Here we simulate effect of treatment on patients treated in 3 hospitals. Naive OLS fails to recover true treatment effect (effect = 2)
+```{python}
+import pandas as pd
+import numpy as np
+import statsmodels.formula.api as smf
+import statsmodels.api as sm
+
+# ── Simulate data with confounding slope variation for clear distinction ──
+np.random.seed(123)
+hospitals = ['H1', 'H2', 'H3']
+# Generate varying slope biases
+slope_biases = {'H1': -2, 'H2': 0, 'H3': 2}
+# Treatment probability correlates with slope_bias: hospitals with lower slope get more treatment
+treat_rates = {h: 0.8 if slope_biases[h]<0 else 0.2 for h in hospitals}
+# Fixed intercepts for simplicity
+intercepts = {'H1': 0, 'H2': 5, 'H3': 10}
+
+data = []
+base_effect = 2.0  # average treatment effect per patient
+n_per = 200
+
+for hosp in hospitals:
+    intercept = intercepts[hosp]
+    bias = slope_biases[hosp]
+    tr_rate = treat_rates[hosp]
+    for _ in range(n_per):
+        tr = np.random.binomial(1, tr_rate)
+        true_slope = base_effect + bias
+        y = intercept + true_slope * tr + np.random.normal(scale=1)
+        data.append({'hospital': hosp, 'treatment': tr, 'y': y})
+
+# Create DataFrame
+df = pd.DataFrame(data)
+
+# ── Fit models: Naive, FE OLS, and random slope LMM ──────────────────────
+models = {
+    'Naïve OLS': smf.ols('y ~ treatment', data=df).fit(),
+    'Fixed-effects OLS': smf.ols('y ~ treatment + C(hospital)', data=df).fit(),
+    'Random-effects LMM': sm.MixedLM.from_formula(
+        'y ~ treatment', groups='hospital', re_formula='1 + treatment', data=df
+    ).fit()
+}
+
+# ── Summarize and display ─────────────────────────────────────────────
+summary = []
+for name, model in models.items():
+    est = model.params['treatment']
+    ci_low, ci_high = model.conf_int().loc['treatment']
+    slope_sd = None
+    if name=='Random-effects LMM':
+        slope_sd = np.sqrt(model.cov_re.iloc[1,1])
+    summary.append({
+        'Model': name,
+        'Estimate': round(est,2),
+        'CI Lower': round(ci_low,2),
+        'CI Upper': round(ci_high,2),
+        'Slope SD': round(slope_sd,2) if slope_sd is not None else np.nan
+    })
+summary_df = pd.DataFrame(summary)
+print(summary_df.to_markdown(index=False))
+
+# ── Visualization: compare model fits ─────────────────────────────────────────
+import matplotlib.pyplot as plt
+
+def plot_naive(ax):
+    ax.scatter(df['treatment'], df['y'], alpha=0.3, label='Data')
+    xs = np.array([0,1])
+    ys = models['Naïve OLS'].params['Intercept'] + models['Naïve OLS'].params['treatment'] * xs
+    ax.plot(xs, ys, color='red', label='Naive fit')
+    ax.set_title('Naive OLS')
+    ax.set_xticks([0,1])
+    ax.set_xticklabels(['Control','Treatment'])
+    ax.legend()
+
+
+def plot_fixed(ax):
+    colors = {'H1':'blue','H2':'green','H3':'orange'}
+    xs = np.array([0,1])
+    for hosp, color in colors.items():
+        sub = df[df['hospital']==hosp]
+        ax.scatter(sub['treatment'], sub['y'], alpha=0.3, color=color, label=hosp)
+        intercept_h = models['Fixed-effects OLS'].params['Intercept'] + \
+                      models['Fixed-effects OLS'].params.get(f'C(hospital)[T.{hosp}]',0)
+        slope = models['Fixed-effects OLS'].params['treatment']
+        ax.plot(xs, intercept_h + slope*xs, color=color)
+    ax.set_title('Fixed-effects OLS')
+    ax.set_xticks([0,1])
+    ax.set_xticklabels(['Control','Treatment'])
+    ax.legend(title='Hospital')
+
+
+def plot_lmm(ax):
+    colors = {'H1':'blue','H2':'green','H3':'orange'}
+    xs = np.array([0,1])
+    re = models['Random-effects LMM'].random_effects
+    base_int = models['Random-effects LMM'].params['Intercept']
+    base_slope = models['Random-effects LMM'].params['treatment']
+    for hosp, color in colors.items():
+        sub = df[df['hospital']==hosp]
+        ax.scatter(sub['treatment'], sub['y'], alpha=0.3, color=color, label=hosp)
+        intercept_h = base_int + re[hosp]['hospital']
+        slope_h = base_slope + re[hosp]['treatment']
+        ax.plot(xs, intercept_h + slope_h*xs, color=color)
+    ax.set_title('Random-effects LMM')
+    ax.set_xticks([0,1])
+    ax.set_xticklabels(['Control','Treatment'])
+    ax.legend(title='Hospital')
+
+# Create figure
+fig, axes = plt.subplots(1,3, figsize=(15,5), sharey=True)
+plot_naive(axes[0])
+plot_fixed(axes[1])
+plot_lmm(axes[2])
+plt.tight_layout()
+plt.show()
+```
